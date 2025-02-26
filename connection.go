@@ -453,7 +453,7 @@ var newClientConnection = func(
 	}
 	if s.config.TokenStore != nil {
 		if token := s.config.TokenStore.Pop(s.tokenStoreKey); token != nil {
-			s.packer.SetToken(token.data)
+			s.packer.SetToken(token.Data)
 		}
 	}
 	return s
