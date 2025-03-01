@@ -309,8 +309,8 @@ func (t *Transport) doDial(
 		t.connIDGenerator,
 		t.statelessResetter,
 		config,
-		initialToken, // Passar o InitialToken como []byte
 		tlsConf,
+		initialToken, // Passar o InitialToken como []byte,
 		initialPacketNumber,
 		use0RTT,
 		hasNegotiatedVersion,
