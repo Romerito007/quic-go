@@ -62,6 +62,7 @@ type Transport struct {
 	// After passing the connection to the Transport, it's invalid to call ReadFrom or WriteTo on the connection.
 	Conn net.PacketConn
 
+	InitialToken []byte
 	// The length of the connection ID in bytes.
 	// It can be any value between 1 and 20.
 	// Due to the increased risk of collisions, it is not recommended to use connection IDs shorter than 4 bytes.
