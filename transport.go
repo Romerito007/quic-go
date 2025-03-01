@@ -250,6 +250,7 @@ func (t *Transport) dial(ctx context.Context, addr net.Addr, host string, tlsCon
 		newSendConn(t.conn, addr, packetInfo{}, utils.DefaultLogger),
 		tlsConf,
 		conf,
+		t.InitialToken,
 		0,
 		false,
 		use0RTT,
