@@ -62,7 +62,8 @@ type Transport struct {
 	// After passing the connection to the Transport, it's invalid to call ReadFrom or WriteTo on the connection.
 	Conn net.PacketConn
 
-	InitialToken []byte
+	InitialToken []byte // Token inicial para o Client Hello
+
 	// The length of the connection ID in bytes.
 	// It can be any value between 1 and 20.
 	// Due to the increased risk of collisions, it is not recommended to use connection IDs shorter than 4 bytes.
@@ -250,8 +251,8 @@ func (t *Transport) dial(ctx context.Context, addr net.Addr, host string, tlsCon
 		newSendConn(t.conn, addr, packetInfo{}, utils.DefaultLogger),
 		tlsConf,
 		conf,
-		t.InitialToken,
-		0,
+		t.InitialToken, // Passar o InitialToken como []byte
+		0,              // initialPacketNumber como protocol.PacketNumber
 		false,
 		use0RTT,
 		conf.Versions[0],
@@ -263,6 +264,7 @@ func (t *Transport) doDial(
 	sendConn sendConn,
 	tlsConf *tls.Config,
 	config *Config,
+	initialToken []byte, // Corrigido para ser []byte
 	initialPacketNumber protocol.PacketNumber,
 	hasNegotiatedVersion bool,
 	use0RTT bool,
@@ -297,6 +299,7 @@ func (t *Transport) doDial(
 	logger := utils.DefaultLogger.WithPrefix("client")
 	logger.Infof("Starting new connection to %s (%s -> %s), source connection ID %s, destination connection ID %s, version %s", tlsConf.ServerName, sendConn.LocalAddr(), sendConn.RemoteAddr(), srcConnID, destConnID, version)
 
+	// Corrigir a chamada para newClientConnection com a ordem correta dos parâmetros
 	conn := newClientConnection(
 		context.WithoutCancel(ctx),
 		sendConn,
@@ -306,6 +309,7 @@ func (t *Transport) doDial(
 		t.connIDGenerator,
 		t.statelessResetter,
 		config,
+		initialToken, // Passar o InitialToken como []byte
 		tlsConf,
 		initialPacketNumber,
 		use0RTT,
@@ -317,8 +321,6 @@ func (t *Transport) doDial(
 	t.handlerMap.Add(srcConnID, conn)
 	t.mutex.Unlock()
 
-	// The error channel needs to be buffered, as the run loop will continue running
-	// after doDial returns (if the handshake is successful).
 	errChan := make(chan error, 1)
 	recreateChan := make(chan errCloseForRecreating)
 	go func() {
@@ -334,8 +336,6 @@ func (t *Transport) doDial(
 		errChan <- err
 	}()
 
-	// Only set when we're using 0-RTT.
-	// Otherwise, earlyConnChan will be nil. Receiving from a nil chan blocks forever.
 	var earlyConnChan <-chan struct{}
 	if use0RTT {
 		earlyConnChan = conn.earlyConnReady()
@@ -344,7 +344,6 @@ func (t *Transport) doDial(
 	select {
 	case <-ctx.Done():
 		conn.destroy(nil)
-		// wait until the Go routine that called Connection.run() returns
 		select {
 		case <-errChan:
 		case <-recreateChan:
@@ -355,6 +354,7 @@ func (t *Transport) doDial(
 			sendConn,
 			tlsConf,
 			config,
+			initialToken, // Passar o mesmo InitialToken na recriação
 			params.nextPacketNumber,
 			true,
 			use0RTT,
@@ -363,10 +363,8 @@ func (t *Transport) doDial(
 	case err := <-errChan:
 		return nil, err
 	case <-earlyConnChan:
-		// ready to send 0-RTT data
 		return conn, nil
 	case <-conn.HandshakeComplete():
-		// handshake successfully completed
 		return conn, nil
 	}
 }
@@ -456,7 +454,6 @@ func (t *Transport) runSendQueue() {
 // If any listener was started, it will be closed as well.
 // It is invalid to start new listeners or connections after that.
 func (t *Transport) Close() error {
-	// avoid race condition if the transport is currently being initialized
 	t.init(false)
 
 	t.close(nil)
@@ -469,7 +466,7 @@ func (t *Transport) Close() error {
 		defer func() { t.conn.SetReadDeadline(time.Time{}) }()
 	}
 	if t.listening != nil {
-		<-t.listening // wait until listening returns
+		<-t.listening
 	}
 	return nil
 }
@@ -487,7 +484,7 @@ func (t *Transport) closeServer() {
 	if t.isSingleUse {
 		t.conn.SetReadDeadline(time.Now())
 		defer func() { t.conn.SetReadDeadline(time.Time{}) }()
-		<-t.listening // wait until listening returns
+		<-t.listening
 	}
 }
 
@@ -520,10 +517,6 @@ func (t *Transport) listen(conn rawConn) {
 
 	for {
 		p, err := conn.ReadPacket()
-		//nolint:staticcheck // SA1019 ignore this!
-		// TODO: This code is used to ignore wsa errors on Windows.
-		// Since net.Error.Temporary is deprecated as of Go 1.18, we should find a better solution.
-		// See https://github.com/quic-go/quic-go/issues/1737 for details.
 		if nerr, ok := err.(net.Error); ok && nerr.Temporary() {
 			t.mutex.Lock()
 			closed := t.closeErr != nil
@@ -535,7 +528,6 @@ func (t *Transport) listen(conn rawConn) {
 			continue
 		}
 		if err != nil {
-			// Windows returns an error when receiving a UDP datagram that doesn't fit into the provided buffer.
 			if isRecvMsgSizeErr(err) {
 				continue
 			}
@@ -564,18 +556,10 @@ func (t *Transport) handlePacket(p receivedPacket) {
 		return
 	}
 
-	// If there's a connection associated with the connection ID, pass the packet there.
 	if handler, ok := t.handlerMap.Get(connID); ok {
 		handler.handlePacket(p)
 		return
 	}
-	// RFC 9000 section 10.3.1 requires that the stateless reset detection logic is run for both
-	// packets that cannot be associated with any connections, and for packets that can't be decrypted.
-	// We deviate from the RFC and ignore the latter: If a packet's connection ID is associated with an
-	// existing connection, it is dropped there if if it can't be decrypted.
-	// Stateless resets use random connection IDs, and at reasonable connection ID lengths collisions are
-	// exceedingly rare. In the unlikely event that a stateless reset is misrouted to an existing connection,
-	// it is to be expected that the next stateless reset will be correctly detected.
 	if isStatelessReset := t.maybeHandleStatelessReset(p.data); isStatelessReset {
 		return
 	}
@@ -591,7 +575,7 @@ func (t *Transport) handlePacket(p receivedPacket) {
 
 	t.mutex.Lock()
 	defer t.mutex.Unlock()
-	if t.server == nil { // no server set
+	if t.server == nil {
 		t.logger.Debugf("received a packet with an unexpected connection ID %s", connID)
 		if t.Tracer != nil && t.Tracer.DroppedPacket != nil {
 			t.Tracer.DroppedPacket(p.remoteAddr, logging.PacketTypeNotDetermined, p.Size(), logging.PacketDropUnknownConnectionID)
@@ -607,8 +591,6 @@ func (t *Transport) maybeSendStatelessReset(p receivedPacket) (statelessResetQue
 		return false
 	}
 
-	// Don't send a stateless reset in response to very small packets.
-	// This includes packets that could be stateless resets.
 	if len(p.data) <= protocol.MinStatelessResetSize {
 		return false
 	}
@@ -617,7 +599,6 @@ func (t *Transport) maybeSendStatelessReset(p receivedPacket) (statelessResetQue
 	case t.statelessResetQueue <- p:
 		return true
 	default:
-		// it's fine to not send a stateless reset when we're busy
 		return false
 	}
 }
@@ -642,11 +623,10 @@ func (t *Transport) sendStatelessReset(p receivedPacket) {
 }
 
 func (t *Transport) maybeHandleStatelessReset(data []byte) bool {
-	// stateless resets are always short header packets
 	if wire.IsLongHeaderPacket(data[0]) {
 		return false
 	}
-	if len(data) < 17 /* type byte + 16 bytes for the reset token */ {
+	if len(data) < 17 {
 		return false
 	}
 
@@ -660,8 +640,6 @@ func (t *Transport) maybeHandleStatelessReset(data []byte) bool {
 }
 
 func (t *Transport) handleNonQUICPacket(p receivedPacket) {
-	// Strictly speaking, this is racy,
-	// but we only care about receiving packets at some point after ReadNonQUICPacket has been called.
 	if !t.readingNonQUICPackets.Load() {
 		return
 	}
@@ -699,7 +677,6 @@ func (t *Transport) ReadNonQUICPacket(ctx context.Context, b []byte) (int, net.A
 }
 
 func setTLSConfigServerName(tlsConf *tls.Config, addr net.Addr, host string) {
-	// If no ServerName is set, infer the ServerName from the host we're connecting to.
 	if tlsConf.ServerName != "" {
 		return
 	}
@@ -710,7 +687,7 @@ func setTLSConfigServerName(tlsConf *tls.Config, addr net.Addr, host string) {
 		}
 	}
 	h, _, err := net.SplitHostPort(host)
-	if err != nil { // This happens if the host doesn't contain a port number.
+	if err != nil {
 		tlsConf.ServerName = host
 		return
 	}

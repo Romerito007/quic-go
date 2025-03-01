@@ -121,12 +121,14 @@ type connection struct {
 
 	srcConnIDLen int
 
-	perspective protocol.Perspective
-	version     protocol.Version
-	config      *Config
+	initialPacketToken []byte
 
-	conn      sendConn
-	sendQueue sender
+	perspective  protocol.Perspective
+	version      protocol.Version
+	config       *Config
+	initialToken []byte
+	conn         sendConn
+	sendQueue    sender
 
 	// lazily initialzed: most connections never migrate
 	pathManager        *pathManager
@@ -351,6 +353,7 @@ var newClientConnection = func(
 	statelessResetter *statelessResetter,
 	conf *Config,
 	tlsConf *tls.Config,
+	initialToken []byte, // Novo parâmetro corrigido para ordem correta
 	initialPacketNumber protocol.PacketNumber,
 	enable0RTT bool,
 	hasNegotiatedVersion bool,
@@ -361,6 +364,7 @@ var newClientConnection = func(
 	s := &connection{
 		conn:                conn,
 		config:              conf,
+		initialPacketToken:  initialToken,
 		origDestConnID:      destConnID,
 		handshakeDestConnID: destConnID,
 		srcConnIDLen:        srcConnID.Len(),
@@ -413,16 +417,11 @@ var newClientConnection = func(
 		MaxBidiStreamNum:               protocol.StreamNum(s.config.MaxIncomingStreams),
 		MaxUniStreamNum:                protocol.StreamNum(s.config.MaxIncomingUniStreams),
 		MaxAckDelay:                    protocol.MaxAckDelayInclGranularity,
-		MaxUDPPayloadSize:              protocol.MaxPacketBufferSize,
 		AckDelayExponent:               protocol.AckDelayExponent,
+		MaxUDPPayloadSize:              protocol.MaxPacketBufferSize,
 		DisableActiveMigration:         true,
-		// For interoperability with quic-go versions before May 2023, this value must be set to a value
-		// different from protocol.DefaultActiveConnectionIDLimit.
-		// If set to the default value, it will be omitted from the transport parameters, which will make
-		// old quic-go versions interpret it as 0, instead of the default value of 2.
-		// See https://github.com/quic-go/quic-go/pull/3806.
-		ActiveConnectionIDLimit:   protocol.MaxActiveConnectionIDs,
-		InitialSourceConnectionID: srcConnID,
+		ActiveConnectionIDLimit:        protocol.MaxActiveConnectionIDs,
+		InitialSourceConnectionID:      srcConnID,
 	}
 	if s.config.EnableDatagrams {
 		params.MaxDatagramFrameSize = wire.MaxDatagramSize
@@ -446,13 +445,19 @@ var newClientConnection = func(
 	s.cryptoStreamManager = newCryptoStreamManager(s.initialStream, s.handshakeStream, oneRTTStream)
 	s.unpacker = newPacketUnpacker(cs, s.srcConnIDLen)
 	s.packer = newPacketPacker(srcConnID, s.connIDManager.Get, s.initialStream, s.handshakeStream, s.sentPacketHandler, s.retransmissionQueue, cs, s.framer, s.receivedPacketHandler, s.datagramQueue, s.perspective)
+
+	// Configurar o InitialToken no packer para o Initial Packet
+	if initialToken != nil {
+		s.packer.SetToken(initialToken)
+	}
+
 	if len(tlsConf.ServerName) > 0 {
 		s.tokenStoreKey = tlsConf.ServerName
 	} else {
 		s.tokenStoreKey = conn.RemoteAddr().String()
 	}
 	if s.config.TokenStore != nil {
-		if token := s.config.TokenStore.Pop(s.tokenStoreKey); token != nil {
+		if token := s.config.TokenStore.Pop(s.tokenStoreKey); token != nil && initialToken == nil {
 			s.packer.SetToken(token.Data)
 		}
 	}
