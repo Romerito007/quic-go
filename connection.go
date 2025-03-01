@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -449,6 +450,7 @@ var newClientConnection = func(
 	// Configurar o InitialToken no packer para o Initial Packet
 	if initialToken != nil {
 		s.packer.SetToken(initialToken)
+		logger.Debugf("Token configurado no packer: %s", hex.EncodeToString(initialToken[:10])+"...")
 	}
 
 	if len(tlsConf.ServerName) > 0 {
